@@ -507,17 +507,17 @@ def artifact_processor(func):
                          stripped_headers)
 
             if check_output_types('lava', output_types):
-                table_name, object_columns, column_map = lava_process_artifact(category,
-                                                                               module_name,
-                                                                               artifact_name,
-                                                                               data_headers,
-                                                                               len(data_list),
-                                                                               func_name=func_name,
-                                                                               data_views=artifact_info.get(
-                                                                                   "data_views"),
-                                                                               artifact_icon=icon,
-                                                                               source_path=source_path)
-                lava_insert_sqlite_data(table_name, data_list, object_columns, data_headers, column_map)
+                artifact_type_id = lava_process_artifact(
+                    category,
+                    module_name,
+                    artifact_name,
+                    data_headers,
+                    len(data_list),
+                    func_name=func_name,
+                    data_views=artifact_info.get("data_views"),
+                    artifact_icon=icon,
+                    source_path=source_path)
+                lava_insert_sqlite_data(artifact_type_id, data_list, data_headers)
 
             if check_output_types('kml', output_types):
                 kmlgen(report_folder, artifact_name, txt_data_list if media_header_info else data_list,

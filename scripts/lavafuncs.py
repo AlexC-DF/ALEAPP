@@ -29,6 +29,7 @@ import json
 import sqlite3
 import sys
 import os
+import typing
 from platform import platform
 from collections import OrderedDict
 import re
@@ -39,48 +40,51 @@ from scripts.context import Context
 
 # Global variables
 lava_data = None
-lava_db = None
+lava_db: typing.Optional[sqlite3.Connection] = None
 lava_db_name = '_lava_artifacts.db'
 lava_json_name = '_lava_data.lava'
 
+DATE_TYPE_NAME = "date"
+DATETIME_TYPE_NAME = "datetime"
+MEDIA_TYPE_NAME = "media"
 
-def sanitize_sql_name(name):
-    """
-    Sanitizes a given name by removing invalid characters and formatting it.
-    This function takes a string `name` and performs the following operations:
-    1. Removes any character that is not a word character (alphanumeric or underscore) or whitespace.
-    2. Replaces consecutive whitespace characters with a single underscore.
-    3. Ensures that the resulting string starts with a letter or an underscore; if not, it prepends an underscore.
-    4. Converts the entire string to lowercase.
-    Args:
-        name (str): The name to be sanitized.
-    Returns:
-        str: The sanitized SQL name.
-    """
+# def sanitize_sql_name(name):
+#     """
+#     Sanitizes a given name by removing invalid characters and formatting it.
+#     This function takes a string `name` and performs the following operations:
+#     1. Removes any character that is not a word character (alphanumeric or underscore) or whitespace.
+#     2. Replaces consecutive whitespace characters with a single underscore.
+#     3. Ensures that the resulting string starts with a letter or an underscore; if not, it prepends an underscore.
+#     4. Converts the entire string to lowercase.
+#     Args:
+#         name (str): The name to be sanitized.
+#     Returns:
+#         str: The sanitized SQL name.
+#     """
+#
+#     sanitized = re.sub(r'[^\w\s]', '', name)
+#     sanitized = re.sub(r'\s+', '_', sanitized)
+#     # Ensure the name starts with a letter or underscore
+#     if sanitized and not sanitized[0].isalpha() and sanitized[0] != '_':
+#         sanitized = '_' + sanitized
+#     return sanitized.lower()
 
-    sanitized = re.sub(r'[^\w\s]', '', name)
-    sanitized = re.sub(r'\s+', '_', sanitized)
-    # Ensure the name starts with a letter or underscore
-    if sanitized and not sanitized[0].isalpha() and sanitized[0] != '_':
-        sanitized = '_' + sanitized
-    return sanitized.lower()
 
-
-def get_sql_type(python_type):
-    """
-    Convert Python type names to SQL type names for database schema creation.
-    Args:
-        python_type (str): The name of the Python type as a string (e.g., 'datetime', 'date', 'str').
-    Returns:
-        str: The corresponding SQL type name. Returns 'INTEGER' for datetime and date types,
-             and 'TEXT' as the default for all other types.
-    """
-
-    type_map = {
-        'datetime': 'INTEGER',
-        'date': 'INTEGER',
-    }
-    return type_map.get(python_type, 'TEXT')
+# def get_sql_type(python_type):
+#     """
+#     Convert Python type names to SQL type names for database schema creation.
+#     Args:
+#         python_type (str): The name of the Python type as a string (e.g., 'datetime', 'date', 'str').
+#     Returns:
+#         str: The corresponding SQL type name. Returns 'INTEGER' for datetime and date types,
+#              and 'TEXT' as the default for all other types.
+#     """
+#
+#     type_map = {
+#         'datetime': 'INTEGER',
+#         'date': 'INTEGER',
+#     }
+#     return type_map.get(python_type, 'TEXT')
 
 
 def initialize_lava(input_path, output_path, input_type):
@@ -125,6 +129,22 @@ def initialize_lava(input_path, output_path, input_type):
                         module_name TEXT NOT NULL,
                         artifact_name TEXT NOT NULL,
                         regex TEXT NOT NULL)''')
+    cursor.execute('''CREATE TABLE _artifact_types (
+                    id INTEGER PRIMARY KEY, 
+                    module_name TEXT NOT NULL, 
+                    artifact_name TEXT NOT NULL, 
+                    fields TEXT NOT NULL,   -- json array of all field names
+                    timestamp_fields TEXT,  -- json array of timestamp fields
+                    media_fields TEXT       -- json array of media fields
+                     );''')
+    cursor.execute('''CREATE INDEX idx_artifact_types_name ON _artifact_types(artifact_name);  -- might not be required given the numbers''')
+    cursor.execute('''CREATE TABLE artifacts (
+                        id INTEGER PRIMARY KEY, 
+                        artifact_type INTEGER,
+                        data TEXT NOT NULL,
+                        FOREIGN KEY (artifact_type) REFERENCES _artifact_types(id)
+                    );''')
+    cursor.execute('''CREATE INDEX idx_artifacts_artifact_type ON artifacts(artifact_type);''')
     cursor.execute('''CREATE TABLE _file_path_list (
                         id INTEGER PRIMARY KEY,
                         file_path TEXT NOT NULL)''')
@@ -132,7 +152,7 @@ def initialize_lava(input_path, output_path, input_type):
                         id INTEGER PRIMARY KEY,
                         artifact_search_pattern_id INTEGER NOT NULL,
                         file_path_id INTEGER NOT NULL,
-                        FOREIGN KEY (artifact_search_pattern_id) REFERENCES _artifact_search_patterns(id),
+                        FOREIGN KEY (artifact_search_pattern_id) REFERENCES _artifact_types(id),
                         FOREIGN KEY (file_path_id) REFERENCES _file_path_list(id))''')
     cursor.execute('''CREATE TABLE _lava_media_items (
                         id TEXT PRIMARY KEY,
@@ -150,6 +170,14 @@ def initialize_lava(input_path, output_path, input_type):
                         artifact_name TEXT,
                         name TEXT,
                         FOREIGN KEY (media_item_id) REFERENCES _lava_media_items(id))''')
+    cursor.execute('''CREATE TABLE timestamps (
+                        id INTEGER PRIMARY KEY, 
+                        artifact INTEGER,
+                        field TEXT NOT NULL,
+                        value INTEGER NOT NULL,
+                        FOREIGN KEY (artifact) REFERENCES artifacts(id));''')
+    cursor.execute('''CREATE INDEX idx_timestamps_artifact ON timestamps(artifact);''')
+    cursor.execute('''CREATE INDEX idx_timestamps_value ON timestamps(value);''')
     cursor.execute('''CREATE VIEW _lava_media_info AS
                         SELECT
                             lmr.id as 'media_ref_id',
@@ -172,7 +200,7 @@ def lava_process_artifact(
         category,
         module_name,
         artifact_name,
-        data,
+        headers,
         record_count=None,
         func_name=None,
         data_views=None,
@@ -185,7 +213,7 @@ def lava_process_artifact(
         category: The category of the artifact.
         module_name: The name of the module that processed the artifact.
         artifact_name: The name of the artifact.
-        data: The name of the columns.
+        headers: The name of the columns.
         func_name: The name of the function that processed the artifact.
         record_count: The number of records in the artifact.
         data_views: The data views of the artifact.
@@ -199,7 +227,7 @@ def lava_process_artifact(
     if func_name is None:
         func_name = artifact_name
 
-    sanitized_table_name, column_map, object_columns = lava_create_sqlite_table(func_name, data)
+    # sanitized_table_name, column_map, object_columns = lava_create_sqlite_table(func_name, data)
 
     # Add artifact metadata
     artifact_info = Context.get_artifact_info()
@@ -214,8 +242,8 @@ def lava_process_artifact(
         lava_data['meta']['modules'].append(module_info)
 
     artifact_meta = {
-        "artifact_key": sanitized_table_name,
-        "tablename": sanitized_table_name,
+        "artifact_key": func_name,
+        #"tablename": sanitized_table_name,
         "name": artifact_name,
         "description": artifact_info.get('description', ''),
         "author": artifact_info.get('author', ''),
@@ -228,9 +256,9 @@ def lava_process_artifact(
 
     artifact = {
         "name": artifact_name,
-        "tablename": sanitized_table_name,
+        #"tablename": sanitized_table_name,
         "module": module_name,
-        "column_map": column_map
+        #"column_map": column_map
     }
     if artifact_icon:
         artifact['artifact_icon'] = artifact_icon
@@ -241,8 +269,8 @@ def lava_process_artifact(
     if source_path:
         artifact['source_path'] = source_path
 
-    if object_columns:
-        artifact["object_columns"] = [{"name": name, "type": type_} for name, type_ in object_columns.items()]
+    # if object_columns:
+    #     artifact["object_columns"] = [{"name": name, "type": type_} for name, type_ in object_columns.items()]
 
     if data_views:
         view_params = None
@@ -258,7 +286,7 @@ def lava_process_artifact(
             sanitized_params = {}
 
             # Get original column names for dynamic sanitization check
-            column_names = [item[0] if isinstance(item, tuple) else item for item in data]
+            column_names = [item[0] if isinstance(item, tuple) else item for item in headers]
 
             # Conversion map for backward compatibility. Remove once modules are updated.
             convert_map = {
@@ -271,10 +299,12 @@ def lava_process_artifact(
                 final_key = convert_map.get(key, key)
 
                 # Sanitize value if it's a column name, otherwise pass through
-                if value in column_names:
-                    sanitized_params[final_key] = sanitize_sql_name(value)
-                else:
-                    sanitized_params[final_key] = value
+                # if value in column_names:
+                #     sanitized_params[final_key] = sanitize_sql_name(value)
+                # else:
+                #     sanitized_params[final_key] = value
+
+                sanitized_params[final_key] = value
 
             data_views["conversation"] = sanitized_params
 
@@ -282,7 +312,20 @@ def lava_process_artifact(
 
     lava_data["artifacts"][category].append(artifact)
 
-    return sanitized_table_name, object_columns, column_map
+    cursor = lava_db.cursor()
+    cursor.execute('''INSERT INTO _artifact_types (module_name, artifact_name, fields, timestamp_fields, media_fields)
+                        VALUES (?, ?, ?, ?, ?) RETURNING id;''',
+                   (
+                       module_name,
+                       artifact_name,
+                       json.dumps([x[0] if isinstance(x, tuple) else x for x in headers]),
+                       json.dumps([x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == DATETIME_TYPE_NAME]),
+                       json.dumps([x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == MEDIA_TYPE_NAME])))
+    artifact_id = cursor.fetchone()[0]
+
+    return artifact_id
+
+    #return sanitized_table_name, object_columns, column_map
 
 
 def lava_add_module(module_name, module_status, file_count=None):
@@ -307,67 +350,68 @@ def lava_add_module(module_name, module_status, file_count=None):
     lava_data["modules"].append(module)
 
 
-def lava_create_sqlite_table(table_name, data):
-    """
-    Creates a SQLite table with the specified name and columns based on the provided data.
-    Parameters:
-        table_name (str): The name of the table to be created in the SQLite database.
-        data (list): A list of tuples or strings representing the columns of the table.
-                     Each tuple should contain the original column name and its data type.
-                     If a string is provided, it is treated as a column name with a default type of TEXT.
-    Returns:
-        tuple: A tuple containing:
-            - sanitized_table_name (str): The sanitized name of the created table.
-            - column_map (dict): A mapping of sanitized column names to their original names.
-            - object_columns (dict): A mapping of sanitized column names to their data types.
-    Raises:
-        Exception: If there is an error during the table creation process.
-    """
-    if not data:
-        return None, None, None
+# def lava_create_sqlite_table(table_name, data):
+#     """
+#     Creates a SQLite table with the specified name and columns based on the provided data.
+#     Parameters:
+#         table_name (str): The name of the table to be created in the SQLite database.
+#         data (list): A list of tuples or strings representing the columns of the table.
+#                      Each tuple should contain the original column name and its data type.
+#                      If a string is provided, it is treated as a column name with a default type of TEXT.
+#     Returns:
+#         tuple: A tuple containing:
+#             - sanitized_table_name (str): The sanitized name of the created table.
+#             - column_map (dict): A mapping of sanitized column names to their original names.
+#             - object_columns (dict): A mapping of sanitized column names to their data types.
+#     Raises:
+#         Exception: If there is an error during the table creation process.
+#     """
+#     if not data:
+#         return None, None, None
+#
+#     sanitized_table_name = sanitize_sql_name(table_name)
+#     cursor = lava_db.cursor()
+#
+#     columns = []
+#     column_map = {}
+#     object_columns = {}
+#
+#     for item in data:
+#         if isinstance(item, tuple):
+#             original_name, data_type = item[:2]  # Only take the first two elements as media item can have more
+#             sanitized_name = sanitize_sql_name(original_name)
+#             sql_type = get_sql_type(data_type)
+#             columns.append(f"{sanitized_name} {sql_type}")
+#             object_columns[sanitized_name] = data_type
+#         else:
+#             original_name = item
+#             sanitized_name = sanitize_sql_name(original_name)
+#             columns.append(f"{sanitized_name} TEXT")
+#
+#         column_map[sanitized_name] = original_name
+#
+#     columns_sql = ', '.join(columns)
+#     cursor.execute(f"CREATE TABLE IF NOT EXISTS {sanitized_table_name} ({columns_sql})")
+#     lava_db.commit()
+#
+#     return sanitized_table_name, column_map, object_columns
 
-    sanitized_table_name = sanitize_sql_name(table_name)
-    cursor = lava_db.cursor()
 
-    columns = []
-    column_map = {}
-    object_columns = {}
-
-    for item in data:
-        if isinstance(item, tuple):
-            original_name, data_type = item[:2]  # Only take the first two elements as media item can have more
-            sanitized_name = sanitize_sql_name(original_name)
-            sql_type = get_sql_type(data_type)
-            columns.append(f"{sanitized_name} {sql_type}")
-            object_columns[sanitized_name] = data_type
-        else:
-            original_name = item
-            sanitized_name = sanitize_sql_name(original_name)
-            columns.append(f"{sanitized_name} TEXT")
-
-        column_map[sanitized_name] = original_name
-
-    columns_sql = ', '.join(columns)
-    cursor.execute(f"CREATE TABLE IF NOT EXISTS {sanitized_table_name} ({columns_sql})")
-    lava_db.commit()
-
-    return sanitized_table_name, column_map, object_columns
-
-
-def lava_insert_sqlite_data(table_name, data, object_columns, headers, column_map):
+def lava_insert_sqlite_data(artifact_type_id: int, data, headers):
     """
     Insert data into a SQLite database table with automatic column sanitization and type conversion.
     This function handles the insertion of multiple rows of data into a specified SQLite table,
     with special handling for complex data types (dict, list) and datetime conversions.
     Args:
-        table_name (str): The name of the SQLite table to insert data into.
+        artifact_id: the id from the _artifact_types table for this artifact.
+        # table_name (str): The name of the SQLite table to insert data into.
         data (list): A list of rows to insert, where each row is a sequence of values
                      corresponding to the headers.
-        object_columns (dict): A dictionary mapping column names to their data types.
-                              Supports 'datetime' type for automatic timestamp conversion.
+        # object_columns (dict): A dictionary mapping column names to their data types.
+        #                       Supports 'datetime' type for automatic timestamp conversion.
         headers (list): A list of column headers. Each header can be a string or a tuple
                        where the first element is the column name.
-        column_map (dict): Column mapping configuration (currently unused in the function).
+        # column_map (dict): Column mapping configuration (currently unused in the function).
     Returns:
         None
     """
@@ -378,42 +422,69 @@ def lava_insert_sqlite_data(table_name, data, object_columns, headers, column_ma
     cursor = lava_db.cursor()
 
     # Use the sanitized column names directly
-    sanitized_columns = [sanitize_sql_name(h[0] if isinstance(h, tuple) else h) for h in headers]
+    #sanitized_columns = [sanitize_sql_name(h[0] if isinstance(h, tuple) else h) for h in headers]
 
     # Prepare the SQL query
-    placeholders = ', '.join(['?' for _ in sanitized_columns])
-    query = f"INSERT INTO {table_name} ({', '.join(sanitized_columns)}) VALUES ({placeholders})"
+    column_names = [x[0] if isinstance(x, tuple) else x for x in headers]
+    timestamp_fields = [x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == DATETIME_TYPE_NAME]
+
+    for row in data:
+        row_object = {column_names[i]: row[i] for i in range(len(row))}
+        for ts_field in timestamp_fields:
+            if isinstance(row_object[ts_field], str):
+                try:
+                    dt = datetime.datetime.fromisoformat(row_object[ts_field])
+                    # Treat naive datetimes as UTC; otherwise int(dt.timestamp()) interprets the
+                    # value in the examiner machine's local tz, producing a wrong epoch off-UTC.
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    row_object[ts_field] = int(dt.timestamp())
+                except ValueError:
+                    # If conversion fails, keep the original value
+                    pass
+            elif isinstance(row_object[ts_field], datetime.datetime):
+                # Treat naive datetimes as UTC (project convention) before converting to epoch.
+                if row_object[ts_field].tzinfo is None:
+                    row_object[ts_field] = row_object[ts_field].replace(tzinfo=datetime.timezone.utc)
+                row_object[ts_field] = int(row_object[ts_field].timestamp())
+        cursor.execute("INSERT INTO artifacts (artifact_type, data) VALUES (?, ?) RETURNING id;", (artifact_type_id, json.dumps(row_object)))
+        artifact_id = cursor.fetchone()[0]
+
+        for ts_field in timestamp_fields:
+            if row_object[ts_field]:
+                cursor.execute("INSERT INTO timestamps (artifact, field, value) VALUES (?, ?, ?);",
+                               (artifact_id, ts_field, row_object[ts_field]))
 
     # Prepare the data for insertion
-    rows_to_insert = []
-    for row in data:
-        processed_row = []
-        for sanitized_column, value in zip(sanitized_columns, row):
-            if isinstance(value, dict) or isinstance(value, list):
-                value = json.dumps(value)
-            if sanitized_column in object_columns and object_columns[sanitized_column] == 'datetime':
-                # Convert datetime to integer (Unix timestamp)
-                if isinstance(value, str):
-                    try:
-                        dt = datetime.datetime.fromisoformat(value)
-                        # Treat naive datetimes as UTC; otherwise int(dt.timestamp()) interprets the
-                        # value in the examiner machine's local tz, producing a wrong epoch off-UTC.
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=datetime.timezone.utc)
-                        value = int(dt.timestamp())
-                    except ValueError:
-                        # If conversion fails, keep the original value
-                        pass
-                elif isinstance(value, datetime.datetime):
-                    # Treat naive datetimes as UTC (project convention) before converting to epoch.
-                    if value.tzinfo is None:
-                        value = value.replace(tzinfo=datetime.timezone.utc)
-                    value = int(value.timestamp())
-            processed_row.append(value)
-        rows_to_insert.append(tuple(processed_row))
-
-    # Execute the insert
-    cursor.executemany(query, rows_to_insert)
+    # rows_to_insert = []
+    # for row in data:
+    #     processed_row = []
+    #     for sanitized_column, value in zip(sanitized_columns, row):
+    #         if isinstance(value, dict) or isinstance(value, list):
+    #             value = json.dumps(value)
+    #         if sanitized_column in object_columns and object_columns[sanitized_column] == 'datetime':
+    #             # Convert datetime to integer (Unix timestamp)
+    #             if isinstance(value, str):
+    #                 try:
+    #                     dt = datetime.datetime.fromisoformat(value)
+    #                     # Treat naive datetimes as UTC; otherwise int(dt.timestamp()) interprets the
+    #                     # value in the examiner machine's local tz, producing a wrong epoch off-UTC.
+    #                     if dt.tzinfo is None:
+    #                         dt = dt.replace(tzinfo=datetime.timezone.utc)
+    #                     value = int(dt.timestamp())
+    #                 except ValueError:
+    #                     # If conversion fails, keep the original value
+    #                     pass
+    #             elif isinstance(value, datetime.datetime):
+    #                 # Treat naive datetimes as UTC (project convention) before converting to epoch.
+    #                 if value.tzinfo is None:
+    #                     value = value.replace(tzinfo=datetime.timezone.utc)
+    #                 value = int(value.timestamp())
+    #         processed_row.append(value)
+    #     rows_to_insert.append(tuple(processed_row))
+    #
+    # # Execute the insert
+    # cursor.executemany(query, rows_to_insert)
     lava_db.commit()
 
 
