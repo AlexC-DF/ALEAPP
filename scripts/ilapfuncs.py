@@ -507,7 +507,7 @@ def artifact_processor(func):
                          stripped_headers)
 
             if check_output_types('lava', output_types):
-                artifact_type_id = lava_process_artifact(
+                artifact_type_id, field_ids = lava_process_artifact(
                     category,
                     module_name,
                     artifact_name,
@@ -517,7 +517,7 @@ def artifact_processor(func):
                     data_views=artifact_info.get("data_views"),
                     artifact_icon=icon,
                     source_path=source_path)
-                lava_insert_sqlite_data(artifact_type_id, data_list, data_headers)
+                lava_insert_sqlite_data(artifact_type_id, data_list, data_headers, field_ids)
 
             if check_output_types('kml', output_types):
                 kmlgen(report_folder, artifact_name, txt_data_list if media_header_info else data_list,

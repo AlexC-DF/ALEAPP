@@ -8,6 +8,7 @@ Global Variables:
     lava_db (sqlite3.Connection): SQLite database connection for artifact storage.
     lava_db_name (str): Name of the SQLite database file.
     lava_json_name (str): Name of the JSON metadata file.
+    field_names: dict[str, int] = {} Mapping of field name to ID in the database
 
 Functions:
     sanitize_sql_name: Sanitizes strings for use as SQL identifiers.
@@ -43,6 +44,7 @@ lava_data = None
 lava_db: typing.Optional[sqlite3.Connection] = None
 lava_db_name = '_lava_artifacts.db'
 lava_json_name = '_lava_data.lava'
+lava_field_names: dict[str, int] = {}
 
 DATE_TYPE_NAME = "date"
 DATETIME_TYPE_NAME = "datetime"
@@ -145,6 +147,7 @@ def initialize_lava(input_path, output_path, input_type):
                         FOREIGN KEY (artifact_type) REFERENCES _artifact_types(id)
                     );''')
     cursor.execute('''CREATE INDEX idx_artifacts_artifact_type ON artifacts(artifact_type);''')
+    cursor.execute('''CREATE TABLE _artifact_field_names (id INTEGER PRIMARY KEY, field TEXT NOT NULL);''')
     cursor.execute('''CREATE TABLE _file_path_list (
                         id INTEGER PRIMARY KEY,
                         file_path TEXT NOT NULL)''')
@@ -173,9 +176,10 @@ def initialize_lava(input_path, output_path, input_type):
     cursor.execute('''CREATE TABLE timestamps (
                         id INTEGER PRIMARY KEY, 
                         artifact INTEGER,
-                        field TEXT NOT NULL,
+                        field INTEGER NOT NULL,
                         value INTEGER NOT NULL,
-                        FOREIGN KEY (artifact) REFERENCES artifacts(id));''')
+                        FOREIGN KEY (artifact) REFERENCES artifacts(id)
+                        FOREIGN KEY (field) REFERENCES _artifact_field_names(id))''')
     cursor.execute('''CREATE INDEX idx_timestamps_artifact ON timestamps(artifact);''')
     cursor.execute('''CREATE INDEX idx_timestamps_value ON timestamps(value);''')
     cursor.execute('''CREATE VIEW _lava_media_info AS
@@ -195,6 +199,20 @@ def initialize_lava(input_path, output_path, input_type):
                         FROM _lava_media_references as lmr
                         LEFT JOIN _lava_media_items as lmi ON lmr.media_item_id = lmi.id''')
 
+
+def lava_process_fields(field_names: list[str]):
+    field_ids = []
+    cur = lava_db.cursor()
+    for field_name in field_names:
+        if (field_id := lava_field_names.get(field_name)) is not None:
+            field_ids.append(field_id)
+        else:
+            cur.execute('''INSERT INTO _artifact_field_names (field) VALUES (?) RETURNING id;''', (field_name,))
+            field_id = cur.fetchone()[0]
+            lava_field_names[field_name] = field_id
+            field_ids.append(field_id)
+
+    return tuple(field_ids)
 
 def lava_process_artifact(
         category,
@@ -323,7 +341,9 @@ def lava_process_artifact(
                        json.dumps([x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == MEDIA_TYPE_NAME])))
     artifact_id = cursor.fetchone()[0]
 
-    return artifact_id
+    field_ids = lava_process_fields([x[0] if isinstance(x, tuple) else x for x in headers])
+
+    return artifact_id, field_ids
 
     #return sanitized_table_name, object_columns, column_map
 
@@ -397,7 +417,7 @@ def lava_add_module(module_name, module_status, file_count=None):
 #     return sanitized_table_name, column_map, object_columns
 
 
-def lava_insert_sqlite_data(artifact_type_id: int, data, headers):
+def lava_insert_sqlite_data(artifact_type_id: int, data, headers, field_ids):
     """
     Insert data into a SQLite database table with automatic column sanitization and type conversion.
     This function handles the insertion of multiple rows of data into a specified SQLite table,
@@ -411,6 +431,7 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers):
         #                       Supports 'datetime' type for automatic timestamp conversion.
         headers (list): A list of column headers. Each header can be a string or a tuple
                        where the first element is the column name.
+        field_ids: a list of field ids from the database corresponding to the headers
         # column_map (dict): Column mapping configuration (currently unused in the function).
     Returns:
         None
@@ -425,12 +446,15 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers):
     #sanitized_columns = [sanitize_sql_name(h[0] if isinstance(h, tuple) else h) for h in headers]
 
     # Prepare the SQL query
+    headers_with_field_ids = zip(headers, field_ids)
     column_names = [x[0] if isinstance(x, tuple) else x for x in headers]
-    timestamp_fields = [x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == DATETIME_TYPE_NAME]
+    timestamp_fields = [
+        (x[0][0], x[1]) if isinstance(x[0], tuple) else x for x in headers_with_field_ids
+        if isinstance(x[0], tuple) and len(x[0]) > 1 and x[0][1] == DATETIME_TYPE_NAME]
 
     for row in data:
         row_object = {column_names[i]: row[i] for i in range(len(row))}
-        for ts_field in timestamp_fields:
+        for ts_field, _ in timestamp_fields:
             if isinstance(row_object[ts_field], str):
                 try:
                     dt = datetime.datetime.fromisoformat(row_object[ts_field])
@@ -450,10 +474,10 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers):
         cursor.execute("INSERT INTO artifacts (artifact_type, data) VALUES (?, ?) RETURNING id;", (artifact_type_id, json.dumps(row_object)))
         artifact_id = cursor.fetchone()[0]
 
-        for ts_field in timestamp_fields:
+        for ts_field, field_id in timestamp_fields:
             if row_object[ts_field]:
                 cursor.execute("INSERT INTO timestamps (artifact, field, value) VALUES (?, ?, ?);",
-                               (artifact_id, ts_field, row_object[ts_field]))
+                               (artifact_id, field_id, row_object[ts_field]))
 
     # Prepare the data for insertion
     # rows_to_insert = []
