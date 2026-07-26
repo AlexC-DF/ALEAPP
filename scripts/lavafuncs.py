@@ -44,49 +44,12 @@ lava_data = None
 lava_db: typing.Optional[sqlite3.Connection] = None
 lava_db_name = '_lava_artifacts.db'
 lava_json_name = '_lava_data.lava'
+lava_category_names: dict[str, int] = {}
 lava_field_names: dict[str, int] = {}
 
 DATE_TYPE_NAME = "date"
 DATETIME_TYPE_NAME = "datetime"
 MEDIA_TYPE_NAME = "media"
-
-# def sanitize_sql_name(name):
-#     """
-#     Sanitizes a given name by removing invalid characters and formatting it.
-#     This function takes a string `name` and performs the following operations:
-#     1. Removes any character that is not a word character (alphanumeric or underscore) or whitespace.
-#     2. Replaces consecutive whitespace characters with a single underscore.
-#     3. Ensures that the resulting string starts with a letter or an underscore; if not, it prepends an underscore.
-#     4. Converts the entire string to lowercase.
-#     Args:
-#         name (str): The name to be sanitized.
-#     Returns:
-#         str: The sanitized SQL name.
-#     """
-#
-#     sanitized = re.sub(r'[^\w\s]', '', name)
-#     sanitized = re.sub(r'\s+', '_', sanitized)
-#     # Ensure the name starts with a letter or underscore
-#     if sanitized and not sanitized[0].isalpha() and sanitized[0] != '_':
-#         sanitized = '_' + sanitized
-#     return sanitized.lower()
-
-
-# def get_sql_type(python_type):
-#     """
-#     Convert Python type names to SQL type names for database schema creation.
-#     Args:
-#         python_type (str): The name of the Python type as a string (e.g., 'datetime', 'date', 'str').
-#     Returns:
-#         str: The corresponding SQL type name. Returns 'INTEGER' for datetime and date types,
-#              and 'TEXT' as the default for all other types.
-#     """
-#
-#     type_map = {
-#         'datetime': 'INTEGER',
-#         'date': 'INTEGER',
-#     }
-#     return type_map.get(python_type, 'TEXT')
 
 
 def initialize_lava(input_path, output_path, input_type):
@@ -131,22 +94,32 @@ def initialize_lava(input_path, output_path, input_type):
                         module_name TEXT NOT NULL,
                         artifact_name TEXT NOT NULL,
                         regex TEXT NOT NULL)''')
+    cursor.execute('''CREATE TABLE _artifact_categories (
+                    id INTEGER PRIMARY KEY,
+                    category TEXT NOT NULL);''')
     cursor.execute('''CREATE TABLE _artifact_types (
                     id INTEGER PRIMARY KEY, 
+                    category INTEGER NOT NULL,
                     module_name TEXT NOT NULL, 
                     artifact_name TEXT NOT NULL, 
+                    description TEXT NOT NULL,
+                    author TEXT NOT NULL, 
+                    created_date TEXT,
+                    last_update_date TEXT,
+                    notes TEXT,
                     fields TEXT NOT NULL,   -- json array of all field names
                     timestamp_fields TEXT,  -- json array of timestamp fields
-                    media_fields TEXT       -- json array of media fields
+                    media_fields TEXT,      -- json array of media fields
+                    FOREIGN KEY (category) REFERENCES _artifact_categories(id)
                      );''')
     cursor.execute('''CREATE INDEX idx_artifact_types_name ON _artifact_types(artifact_name);  -- might not be required given the numbers''')
-    cursor.execute('''CREATE TABLE artifacts (
+    cursor.execute('''CREATE TABLE records (
                         id INTEGER PRIMARY KEY, 
                         artifact_type INTEGER,
                         data TEXT NOT NULL,
                         FOREIGN KEY (artifact_type) REFERENCES _artifact_types(id)
                     );''')
-    cursor.execute('''CREATE INDEX idx_artifacts_artifact_type ON artifacts(artifact_type);''')
+    cursor.execute('''CREATE INDEX idx_artifacts_artifact_type ON records(artifact_type);''')
     cursor.execute('''CREATE TABLE _artifact_field_names (id INTEGER PRIMARY KEY, field TEXT NOT NULL);''')
     cursor.execute('''CREATE TABLE _file_path_list (
                         id INTEGER PRIMARY KEY,
@@ -175,19 +148,19 @@ def initialize_lava(input_path, output_path, input_type):
                         FOREIGN KEY (media_item_id) REFERENCES _lava_media_items(id))''')
     cursor.execute('''CREATE TABLE timestamps (
                         id INTEGER PRIMARY KEY, 
-                        artifact INTEGER,
+                        record INTEGER,
                         field INTEGER NOT NULL,
                         value INTEGER NOT NULL,
-                        FOREIGN KEY (artifact) REFERENCES artifacts(id)
+                        FOREIGN KEY (record) REFERENCES records(id)
                         FOREIGN KEY (field) REFERENCES _artifact_field_names(id))''')
-    cursor.execute('''CREATE INDEX idx_timestamps_artifact ON timestamps(artifact);''')
+    cursor.execute('''CREATE INDEX idx_timestamps_record ON timestamps(record);''')
     cursor.execute('''CREATE INDEX idx_timestamps_value ON timestamps(value);''')
     cursor.execute('''CREATE TABLE text_index_content (
                         rowid INTEGER PRIMARY KEY,
-                        artifact INTEGER NOT NULL,
+                        record INTEGER NOT NULL,
                         field INTEGER NOT NULL,
                         text TEXT NOT NULL,
-                        FOREIGN KEY (artifact) REFERENCES artifacts(id)
+                        FOREIGN KEY (record) REFERENCES records(id)
                         FOREIGN KEY (field) REFERENCES _artifact_field_names(id));''')
     cursor.execute('''CREATE VIRTUAL TABLE text_index_fts USING fts4(content="text_index_content", text);''')
     cursor.execute('''CREATE VIEW _lava_media_info AS
@@ -339,11 +312,25 @@ def lava_process_artifact(
     lava_data["artifacts"][category].append(artifact)
 
     cursor = lava_db.cursor()
-    cursor.execute('''INSERT INTO _artifact_types (module_name, artifact_name, fields, timestamp_fields, media_fields)
-                        VALUES (?, ?, ?, ?, ?) RETURNING id;''',
+    if category not in lava_category_names:
+        cursor.execute('''INSERT INTO _artifact_categories (category) VALUES (?) RETURNING id;''', (category,))
+        lava_category_names[category] = cursor.fetchone()[0]
+
+    category_id = lava_category_names[category]
+
+    cursor.execute('''INSERT INTO _artifact_types (
+                        category, module_name, artifact_name, description, author, created_date, last_update_date, 
+                        notes, fields,  timestamp_fields, media_fields)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id;''',
                    (
+                       category_id,
                        module_name,
                        artifact_name,
+                       artifact_info.get('description', ''),
+                       artifact_info.get('author', ''),
+                       artifact_info.get('creation_date', ''),
+                       artifact_info.get('last_update_date', ''),
+                       artifact_info.get('notes', ''),
                        json.dumps([x[0] if isinstance(x, tuple) else x for x in headers]),
                        json.dumps([x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == DATETIME_TYPE_NAME]),
                        json.dumps([x[0] for x in headers if isinstance(x, tuple) and len(x) > 1 and x[1] == MEDIA_TYPE_NAME])))
@@ -449,9 +436,9 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers, field_ids):
         return
 
     cursor = lava_db.cursor()
-    artifact_insert_query = "INSERT INTO artifacts (artifact_type, data) VALUES (?, ?) RETURNING id;"
-    timestamp_insert_query = "INSERT INTO timestamps (artifact, field, value) VALUES (?, ?, ?);"
-    text_index_insert_query = "INSERT INTO text_index_content (artifact, field, text) VALUES (?, ?, ?)"
+    artifact_insert_query = "INSERT INTO records (artifact_type, data) VALUES (?, ?) RETURNING id;"
+    timestamp_insert_query = "INSERT INTO timestamps (record, field, value) VALUES (?, ?, ?);"
+    text_index_insert_query = "INSERT INTO text_index_content (record, field, text) VALUES (?, ?, ?)"
     # Use the sanitized column names directly
     #sanitized_columns = [sanitize_sql_name(h[0] if isinstance(h, tuple) else h) for h in headers]
 
