@@ -182,6 +182,14 @@ def initialize_lava(input_path, output_path, input_type):
                         FOREIGN KEY (field) REFERENCES _artifact_field_names(id))''')
     cursor.execute('''CREATE INDEX idx_timestamps_artifact ON timestamps(artifact);''')
     cursor.execute('''CREATE INDEX idx_timestamps_value ON timestamps(value);''')
+    cursor.execute('''CREATE TABLE text_index_content (
+                        rowid INTEGER PRIMARY KEY,
+                        artifact INTEGER NOT NULL,
+                        field INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        FOREIGN KEY (artifact) REFERENCES artifacts(id)
+                        FOREIGN KEY (field) REFERENCES _artifact_field_names(id));''')
+    cursor.execute('''CREATE VIRTUAL TABLE text_index_fts USING fts4(content="text_index_content", text);''')
     cursor.execute('''CREATE VIEW _lava_media_info AS
                         SELECT
                             lmr.id as 'media_ref_id',
@@ -441,19 +449,21 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers, field_ids):
         return
 
     cursor = lava_db.cursor()
-
+    artifact_insert_query = "INSERT INTO artifacts (artifact_type, data) VALUES (?, ?) RETURNING id;"
+    timestamp_insert_query = "INSERT INTO timestamps (artifact, field, value) VALUES (?, ?, ?);"
+    text_index_insert_query = "INSERT INTO text_index_content (artifact, field, text) VALUES (?, ?, ?)"
     # Use the sanitized column names directly
     #sanitized_columns = [sanitize_sql_name(h[0] if isinstance(h, tuple) else h) for h in headers]
 
     # Prepare the SQL query
     headers_with_field_ids = zip(headers, field_ids)
-    column_names = [x[0] if isinstance(x, tuple) else x for x in headers]
+    field_names = [x[0] if isinstance(x, tuple) else x for x in headers]
     timestamp_fields = [
         (x[0][0], x[1]) if isinstance(x[0], tuple) else x for x in headers_with_field_ids
         if isinstance(x[0], tuple) and len(x[0]) > 1 and x[0][1] == DATETIME_TYPE_NAME]
 
     for row in data:
-        row_object = {column_names[i]: row[i] for i in range(len(row))}
+        row_object = {field_names[i]: row[i] for i in range(len(row))}
         for ts_field, _ in timestamp_fields:
             if isinstance(row_object[ts_field], str):
                 try:
@@ -471,44 +481,18 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers, field_ids):
                 if row_object[ts_field].tzinfo is None:
                     row_object[ts_field] = row_object[ts_field].replace(tzinfo=datetime.timezone.utc)
                 row_object[ts_field] = int(row_object[ts_field].timestamp())
-        cursor.execute("INSERT INTO artifacts (artifact_type, data) VALUES (?, ?) RETURNING id;", (artifact_type_id, json.dumps(row_object)))
+        cursor.execute(artifact_insert_query, (artifact_type_id, json.dumps(row_object)))
         artifact_id = cursor.fetchone()[0]
 
         for ts_field, field_id in timestamp_fields:
             if row_object[ts_field]:
-                cursor.execute("INSERT INTO timestamps (artifact, field, value) VALUES (?, ?, ?);",
+                cursor.execute(timestamp_insert_query,
                                (artifact_id, field_id, row_object[ts_field]))
 
-    # Prepare the data for insertion
-    # rows_to_insert = []
-    # for row in data:
-    #     processed_row = []
-    #     for sanitized_column, value in zip(sanitized_columns, row):
-    #         if isinstance(value, dict) or isinstance(value, list):
-    #             value = json.dumps(value)
-    #         if sanitized_column in object_columns and object_columns[sanitized_column] == 'datetime':
-    #             # Convert datetime to integer (Unix timestamp)
-    #             if isinstance(value, str):
-    #                 try:
-    #                     dt = datetime.datetime.fromisoformat(value)
-    #                     # Treat naive datetimes as UTC; otherwise int(dt.timestamp()) interprets the
-    #                     # value in the examiner machine's local tz, producing a wrong epoch off-UTC.
-    #                     if dt.tzinfo is None:
-    #                         dt = dt.replace(tzinfo=datetime.timezone.utc)
-    #                     value = int(dt.timestamp())
-    #                 except ValueError:
-    #                     # If conversion fails, keep the original value
-    #                     pass
-    #             elif isinstance(value, datetime.datetime):
-    #                 # Treat naive datetimes as UTC (project convention) before converting to epoch.
-    #                 if value.tzinfo is None:
-    #                     value = value.replace(tzinfo=datetime.timezone.utc)
-    #                 value = int(value.timestamp())
-    #         processed_row.append(value)
-    #     rows_to_insert.append(tuple(processed_row))
-    #
-    # # Execute the insert
-    # cursor.executemany(query, rows_to_insert)
+        for field_name, field_id in zip(field_names, field_ids):
+            if isinstance(row_object[field_name], str) and len(row_object[field_name]) > 5:  # TODO set this threshold with some data backing it
+                cursor.execute(text_index_insert_query, (artifact_id, field_id, row_object[field_name]))
+
     lava_db.commit()
 
 
@@ -738,6 +722,14 @@ def lava_finalize_output(output_path):
     # Save LAVA JSON output
     with open(os.path.join(output_path, lava_json_name), 'w', encoding='utf-8') as f:
         json.dump(lava_data, f, indent=4)
+
+    # populate the FTS index
+
+    cur = lava_db.cursor()
+    cur.execute('''INSERT INTO text_index_fts (docid, text) SELECT rowid, text FROM text_index_content;''')
+    cur.execute('''INSERT INTO text_index_fts(text_index_fts) VALUES('optimize');''')
+
+    lava_db.commit()
 
     # Close the SQLite database
     lava_db.close()
