@@ -47,6 +47,8 @@ lava_json_name = '_lava_data.lava'
 lava_category_names: dict[str, int] = {}
 lava_field_names: dict[str, int] = {}
 
+STORE_JSONB = True
+
 DATE_TYPE_NAME = "date"
 DATETIME_TYPE_NAME = "datetime"
 MEDIA_TYPE_NAME = "media"
@@ -97,7 +99,7 @@ def initialize_lava(input_path, output_path, input_type):
     cursor.execute('''CREATE TABLE _artifact_categories (
                     id INTEGER PRIMARY KEY,
                     category TEXT NOT NULL);''')
-    cursor.execute('''CREATE TABLE _artifact_types (
+    cursor.execute(f'''CREATE TABLE _artifact_types (
                     id INTEGER PRIMARY KEY, 
                     category INTEGER NOT NULL,
                     module_name TEXT NOT NULL, 
@@ -107,16 +109,16 @@ def initialize_lava(input_path, output_path, input_type):
                     created_date TEXT,
                     last_update_date TEXT,
                     notes TEXT,
-                    fields TEXT NOT NULL,   -- json array of all field names
-                    timestamp_fields TEXT,  -- json array of timestamp fields
-                    media_fields TEXT,      -- json array of media fields
+                    fields {"BLOB" if STORE_JSONB else "TEXT"} NOT NULL,   -- json array of all field names
+                    timestamp_fields {"BLOB" if STORE_JSONB else "TEXT"},  -- json array of timestamp fields
+                    media_fields {"BLOB" if STORE_JSONB else "TEXT"},      -- json array of media fields
                     FOREIGN KEY (category) REFERENCES _artifact_categories(id)
                      );''')
     cursor.execute('''CREATE INDEX idx_artifact_types_name ON _artifact_types(artifact_name);  -- might not be required given the numbers''')
-    cursor.execute('''CREATE TABLE records (
+    cursor.execute(f'''CREATE TABLE records (
                         id INTEGER PRIMARY KEY, 
                         artifact_type INTEGER,
-                        data TEXT NOT NULL,
+                        data {"BLOB" if STORE_JSONB else "TEXT"} NOT NULL,
                         FOREIGN KEY (artifact_type) REFERENCES _artifact_types(id)
                     );''')
     cursor.execute('''CREATE INDEX idx_artifacts_artifact_type ON records(artifact_type);''')
@@ -318,10 +320,13 @@ def lava_process_artifact(
 
     category_id = lava_category_names[category]
 
-    cursor.execute('''INSERT INTO _artifact_types (
+    cursor.execute(f'''INSERT INTO _artifact_types (
                         category, module_name, artifact_name, description, author, created_date, last_update_date, 
                         notes, fields,  timestamp_fields, media_fields)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id;''',
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 
+                                {"jsonb(?)" if STORE_JSONB else "?"}, 
+                                {"jsonb(?)" if STORE_JSONB else "?"}, 
+                                {"jsonb(?)" if STORE_JSONB else "?"}) RETURNING id;''',
                    (
                        category_id,
                        module_name,
@@ -436,7 +441,10 @@ def lava_insert_sqlite_data(artifact_type_id: int, data, headers, field_ids):
         return
 
     cursor = lava_db.cursor()
-    artifact_insert_query = "INSERT INTO records (artifact_type, data) VALUES (?, ?) RETURNING id;"
+    if STORE_JSONB:
+        artifact_insert_query = "INSERT INTO records (artifact_type, data) VALUES (?, jsonb(?)) RETURNING id;"
+    else:
+        artifact_insert_query = "INSERT INTO records (artifact_type, data) VALUES (?, ?) RETURNING id;"
     timestamp_insert_query = "INSERT INTO timestamps (record, field, value) VALUES (?, ?, ?);"
     text_index_insert_query = "INSERT INTO text_index_content (record, field, text) VALUES (?, ?, ?)"
     # Use the sanitized column names directly
@@ -718,5 +726,7 @@ def lava_finalize_output(output_path):
 
     lava_db.commit()
 
+    cur.execute('''PRAGMA optimize;''')
+    cur.execute('''VACUUM;''')
     # Close the SQLite database
     lava_db.close()
